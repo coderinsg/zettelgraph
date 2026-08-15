@@ -22,7 +22,6 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 # --- CONFIGURATION (loaded from provider.yaml) ---
-
 _CONFIG_PATH = os.environ.get("PROVIDER_CONFIG_PATH", "provider.yaml")
 if os.path.exists(_CONFIG_PATH):
     with open(_CONFIG_PATH, "r", encoding="utf-8") as _f:
