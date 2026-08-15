@@ -1,0 +1,43 @@
+# =============================================================================
+#  Knowledge Vault — LLM Provider Configuration
+#
+#  Externalizes connection parameters for every supported inference provider.
+#  Select the active provider with the "active_provider" key below.
+#
+#  Cloud API keys may be left blank here and instead supplied via the
+#  matching environment variable (recommended for secrets):
+#    OPENAI_API_KEY     /   ANTHROPIC_API_KEY
+# =============================================================================
+
+# Active provider: LMSTUDIO | OLLAMA | OPENAI | ANTHROPIC
+active_provider: OPENAI
+
+# Default generation parameters (applied to all providers unless overridden)
+max_tokens: 4096
+temperature: 0.2
+
+providers:
+  LMSTUDIO:
+    url: http://localhost:1234/v1/chat/completions
+    model: google/gemma-4-e4b
+
+  OLLAMA:
+    url: http://localhost:11434/api/generate
+    model: llama3
+
+  OPENAI:
+    # OpenAI-compatible /chat/completions endpoint (override for Azure etc.)
+    base_url: https://openrouter.ai/api/v1
+    model: openrouter/free
+    api_key: ""          # or set OPENAI_API_KEY env var
+
+  ANTHROPIC:
+    url: https://api.anthropic.com/v1/messages
+    model: claude-3-5-sonnet-20241022
+    api_key: ""          # or set ANTHROPIC_API_KEY env var
+
+  # Web Content Fetching Configuration — used when processing .web source files
+  WEB:
+    user_agent: "Mozilla/5.0 (compatible; KnowledgeVault/1.0; +https://github.com/zettelgraph)"
+    timeout: 30
+    extract_main_content: true
