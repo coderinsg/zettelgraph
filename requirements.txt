@@ -15,3 +15,7 @@ networkx>=3.2.1
 # Local Embedding Generation
 sentence-transformers>=2.6.0
 torch>=2.2.0
+
+# Web Content Extraction and Markdown Conversion
+html2text>=2025.4.15
+readability-lxml>=0.8.4

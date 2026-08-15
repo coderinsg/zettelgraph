@@ -13,17 +13,50 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 from sentence_transformers import SentenceTransformer
+import html2text
+from readability import Document
 
 # 1. Silence all Hugging Face Hub connection warnings and logger noise
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-# --- CONFIGURATION ---
-PROVIDER = "LMSTUDIO"
-MODEL_NAME = "google/gemma-4-e4b"
-LMSTUDIO_URL = "http://localhost:1234/v1/chat/completions"
-OLLAMA_URL = "http://localhost:11434/api/generate"
+# --- CONFIGURATION (loaded from provider.yaml) ---
+
+_CONFIG_PATH = os.environ.get("PROVIDER_CONFIG_PATH", "provider.yaml")
+if os.path.exists(_CONFIG_PATH):
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as _f:
+        _CONFIG = yaml.safe_load(_f) or {}
+else:
+    print(f"      ! provider.yaml not found at {_CONFIG_PATH}; falling back to built-in defaults.")
+    _CONFIG = {}
+
+PROVIDER = _CONFIG.get("active_provider", "LMSTUDIO").upper()
+MAX_TOKENS = int(_CONFIG.get("max_tokens", 4096))
+TEMPERATURE = float(_CONFIG.get("temperature", 0.2))
+
+_P = _CONFIG.get("providers", {})
+
+# Per-provider connection parameters — each resolves from provider.yaml with inline fallbacks
+LMSTUDIO_URL = _P.get("LMSTUDIO", {}).get("url", "http://localhost:1234/v1/chat/completions")
+LMSTUDIO_MODEL = _P.get("LMSTUDIO", {}).get("model", "google/gemma-4-e4b")
+
+OLLAMA_URL = _P.get("OLLAMA", {}).get("url", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = _P.get("OLLAMA", {}).get("model", "llama3")
+
+OPENAI_BASE_URL = _P.get("OPENAI", {}).get("base_url", "https://api.openai.com/v1")
+OPENAI_MODEL = _P.get("OPENAI", {}).get("model", "gpt-4o")
+# Cloud API keys: env var takes precedence, then provider.yaml value
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or _P.get("OPENAI", {}).get("api_key", "")
+
+ANTHROPIC_URL = _P.get("ANTHROPIC", {}).get("url", "https://api.anthropic.com/v1/messages")
+ANTHROPIC_MODEL = _P.get("ANTHROPIC", {}).get("model", "claude-3-5-sonnet-20241022")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or _P.get("ANTHROPIC", {}).get("api_key", "")
+
+# Web Content Fetching Configuration (loaded from provider.yaml)
+WEB_USER_AGENT = _P.get("WEB", {}).get("user_agent", "Mozilla/5.0 (compatible; KnowledgeVault/1.0)")
+WEB_TIMEOUT = int(_P.get("WEB", {}).get("timeout", 30))
+WEB_EXTRACT_MAIN_CONTENT = _P.get("WEB", {}).get("extract_main_content", True)
 
 RAW_INCOMING = "./raw/incoming"
 RAW_ARCHIVE = "./raw/archive"
@@ -56,13 +89,13 @@ class OKFZettel:
             self.content_body = content[yaml_match.end():].strip()
         else:
             self.content_body = content.strip()
-            self.metadata = {"id": self.file_path.stem, "title": self.file_path.stem, "type": "concept", "tags": [], "summary": ""}
+            self.metadata = {"id": self.file_path.stem, "title": self.file_path.stem, "type": "concept", "tags": [], "summary": "", "why_should_i_care": ""}
 
         self.edges = self.LINK_PATTERN.findall(self.content_body)
 
     @classmethod
     def write_to_disk(cls, directory: Path, z_id: str, title: str, z_type: str,
-                      summary: str, tags: List[str], body: str) -> 'OKFZettel':
+                      summary: str, tags: List[str], body: str, why_care: str = "") -> 'OKFZettel':
         """Enforces clean schema verification before writing files to local disk storage."""
         file_path = directory / f"{z_id}.md"
         metadata = {
@@ -72,10 +105,14 @@ class OKFZettel:
             "type": z_type,
             "tags": tags,
             "summary": summary,
+            "why_should_i_care": why_care,
             "last_modified": datetime.now(timezone.utc).strftime("%Y-%m-%d")
         }
         yaml_header = yaml.dump(metadata, sort_keys=False, allow_unicode=True)
-        full_markdown = f"---\n{yaml_header}---\n\n# {title}\n\n{body.strip()}\n"
+        body = body.strip()
+        if why_care:
+            body = f"> **Why should I care?** {why_care.strip()}\n\n{body}"
+        full_markdown = f"---\n{yaml_header}---\n\n# {title}\n\n{body}\n"
 
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(full_markdown)
@@ -84,19 +121,72 @@ class OKFZettel:
 # --- UTILITIES & LLM INTERACTION ---
 
 def call_llm(prompt: str, system_prompt: str = "") -> Optional[str]:
-    """Sends requests to local inference endpoint, returning raw generated text strings safely."""
-    url = LMSTUDIO_URL if PROVIDER == "LMSTUDIO" else OLLAMA_URL
-    headers = {"Content-Type": "application/json"}
+    """Routes LLM requests to the configured provider, supporting local and cloud endpoints."""
+    handlers = {
+        "LMSTUDIO": _call_lmstudio,
+        "OLLAMA": _call_ollama,
+        "OPENAI": _call_openai,
+        "ANTHROPIC": _call_anthropic,
+    }
+    handler = handlers.get(PROVIDER.upper())
+    if not handler:
+        print(f"      ! Unknown LLM provider configured: {PROVIDER}. Valid: LMSTUDIO, OLLAMA, OPENAI, ANTHROPIC")
+        return None
+    return handler(prompt, system_prompt)
 
-    if PROVIDER == "LMSTUDIO":
-        payload = {
-            "model": MODEL_NAME,
-            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
-            "temperature": 0.2
-        }
-    else:
-        payload = {"model": MODEL_NAME, "prompt": prompt, "system": system_prompt, "stream": False}
+def _call_lmstudio(prompt: str, system_prompt: str) -> Optional[str]:
+    """Sends a chat completion request to a local LM Studio (OpenAI-compatible) endpoint."""
+    payload = {
+        "model": LMSTUDIO_MODEL,
+        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+    }
+    return _request(LMSTUDIO_URL, {"Content-Type": "application/json"}, payload, _extract_openai_response)
 
+def _call_openai(prompt: str, system_prompt: str) -> Optional[str]:
+    """Sends a chat completion request to the OpenAI cloud API (OpenAI-compatible endpoint)."""
+    if not OPENAI_API_KEY:
+        print("      ! OPENAI_API_KEY environment variable is not set. Cannot reach OpenAI endpoints.")
+        return None
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+    }
+    return _request(f"{OPENAI_BASE_URL}/chat/completions", headers, payload, _extract_openai_response)
+
+def _call_anthropic(prompt: str, system_prompt: str) -> Optional[str]:
+    """Sends a message request to the Anthropic cloud API (Claude models)."""
+    if not ANTHROPIC_API_KEY:
+        print("      ! ANTHROPIC_API_KEY environment variable is not set. Cannot reach Anthropic endpoints.")
+        return None
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-07",
+    }
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system_prompt:
+        payload["system"] = system_prompt
+    return _request(ANTHROPIC_URL, headers, payload, _extract_anthropic_response)
+
+def _call_ollama(prompt: str, system_prompt: str) -> Optional[str]:
+    """Sends a generation request to a local Ollama endpoint."""
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "system": system_prompt, "stream": False}
+    return _request(OLLAMA_URL, {"Content-Type": "application/json"}, payload, _extract_ollama_response)
+
+def _request(url: str, headers: Dict, payload: Dict, extract_fn) -> Optional[str]:
+    """Dispatches an HTTP POST to an LLM endpoint and unwraps the generated text."""
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=120)
         if response.status_code != 200:
@@ -104,7 +194,7 @@ def call_llm(prompt: str, system_prompt: str = "") -> Optional[str]:
             return None
 
         res_obj = response.json()
-        raw_output = res_obj['choices'][0]['message']['content'] if PROVIDER == "LMSTUDIO" else res_obj.get('response', '')
+        raw_output = extract_fn(res_obj)
 
         if not raw_output or not raw_output.strip():
             print(f"\n[DEBUG] Empty response generated. Raw Server JSON Payload:\n{res_obj}\n")
@@ -114,6 +204,23 @@ def call_llm(prompt: str, system_prompt: str = "") -> Optional[str]:
     except Exception as e:
         print(f"      ! Connection Failure: {e}")
         return None
+
+def _extract_openai_response(res_obj: Dict) -> str:
+    """Extracts text from an OpenAI-compatible (incl. LM Studio) response."""
+    return res_obj.get('choices', [{}])[0].get('message', {}).get('content', '')
+
+def _extract_ollama_response(res_obj: Dict) -> str:
+    """Extracts text from an Ollama generate response."""
+    return res_obj.get('response', '')
+
+def _extract_anthropic_response(res_obj: Dict) -> str:
+    """Extracts text from an Anthropic messages response."""
+    content = res_obj.get('content', [])
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                return block.get('text', '')
+    return ''
 
 def extract_text(path: str) -> Optional[str]:
     ext = os.path.splitext(path)[1].lower()
@@ -125,6 +232,142 @@ def extract_text(path: str) -> Optional[str]:
             for page in doc: text += page.get_text("text") + "\n"
         return text.strip()
     return None
+
+def convert_url_to_markdown(url: str) -> Optional[str]:
+    """Fetches a URL and converts the HTML content to clean Markdown."""
+    try:
+        headers = {"User-Agent": WEB_USER_AGENT}
+        response = requests.get(url, headers=headers, timeout=WEB_TIMEOUT)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        print(f"      ! Failed to fetch {url}: {e}")
+        return None
+
+    html_content = response.text
+
+    if WEB_EXTRACT_MAIN_CONTENT:
+        try:
+            doc = Document(html_content)
+            title = doc.title() or ""
+            html_content = doc.summary()
+        except Exception:
+            title = ""
+    else:
+        title = ""
+
+    h = html2text.HTML2Text()
+    h.ignore_images = True
+    h.body_width = 0
+    markdown = h.handle(html_content)
+
+    if title:
+        markdown = f"# {title}\n\n{markdown}"
+
+    return markdown.strip()
+
+def extract_urls_from_web_file(path: str) -> List[str]:
+    """Reads a .web source file and returns a list of URLs (one per non-comment line)."""
+    urls = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                urls.append(line)
+    return urls
+
+def _shred_text_to_zettels(raw_text: str, source_label: str, table, embed_model) -> None:
+    """Chunks text and runs the LLM pipeline to produce OKF zettel notes."""
+    chunk_size, overlap = 102400, 500
+    chunks = [raw_text[i:i + chunk_size] for i in range(0, len(raw_text), chunk_size - overlap)]
+    print(f"    > Shredding [{source_label}] into {len(chunks)} chunks...")
+
+    for idx, chunk in enumerate(chunks):
+        print(f"      Processing chunk {idx + 1}/{len(chunks)}...")
+
+        shred_sys = (
+            "Deconstruct the incoming text into atomic, self-contained zettel concepts.\n"
+            "Output each concept using the plain-text layout below.\n\n"
+            "<<<START_ZETTEL>>>\n"
+            "TITLE: Title of the concept\n"
+            "TYPE: concept\n"
+            "TAGS: tag1, tag2\n"
+            "SUMMARY: Short structural overview under 50 words.\n"
+            "WHY: One sentence. Why a reader should care about this concept.\n"
+            "RELATED: Key Topic A, Key Topic B\n"
+            "BODY:\n"
+            "Deep-dive analytical description. Minimum 200 words.\n"
+            "Explain mechanics and implications.\n"
+            "<<<END_ZETTEL>>>"
+        )
+
+        raw_output = call_llm(f"TARGET CONTENT TO TRANSLATE:\n{chunk}", shred_sys)
+        if not raw_output:
+            print(f"      ! Chunk {idx + 1} failed: The LLM returned a blank string. Check your provider config and context limits.")
+            continue
+
+        # Parse out zettel text blocks cleanly using text tokens
+        zettel_blocks = re.findall(r'<<<START_ZETTEL>>>(.*?)<<<END_ZETTEL>>>', raw_output, re.DOTALL)
+
+        if not zettel_blocks:
+            print(f"      ! Chunk {idx + 1} skipped: Could not locate text bounds (<<<START_ZETTEL>>>).")
+            continue
+
+        for block in zettel_blocks:
+            # Direct line-by-line field scrapers
+            def get_field(field_name: str) -> str:
+                m = re.search(rf'^\s*{field_name}\s*:\s*(.*)$', block, re.MULTILINE | re.IGNORECASE)
+                return m.group(1).strip() if m else ""
+
+            title_val = get_field("TITLE")
+            type_val = get_field("TYPE") or "concept"
+            summary_val = get_field("SUMMARY")
+            why_val = get_field("WHY")
+            related_raw = get_field("RELATED")
+
+            tags_raw = get_field("TAGS")
+            tags_val = [t.strip() for t in tags_raw.split(',') if t.strip()]
+
+            body_match = re.search(r'BODY:\s*(.*)', block, re.DOTALL | re.IGNORECASE)
+            body_val = body_match.group(1).strip() if body_match else ""
+
+            if not title_val or not body_val: continue
+
+            z_id = f"z_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+
+            # Deterministic Vector Link Resolution using LanceDB
+            discovered_links = []
+            related_topics = [r.strip() for r in related_raw.split(',') if r.strip()]
+            for topic in related_topics:
+                topic_vector = embed_model.encode(topic).tolist()
+                neighbors = table.search(topic_vector).limit(1).to_list()
+                if neighbors and neighbors[0]['id'] != 'init':
+                    target_id = neighbors[0]['id']
+                    rel_type = re.sub(r'[^a-zA-Z0-9_]', '_', topic.lower().strip())
+                    discovered_links.append(f"[[related_to_{rel_type}::{target_id}]]")
+
+            # Combine body with discovered relational links
+            if discovered_links:
+                link_section = "\n".join([f"- {link}" for link in discovered_links])
+                final_body = f"{body_val}\n\n## Graph Connections\n{link_section}"
+            else:
+                final_body = body_val
+
+            # Write out pure Markdown files to disk
+            OKFZettel.write_to_disk(
+                directory=Path(ZETTEL_DIR),
+                z_id=z_id,
+                title=title_val,
+                z_type=type_val,
+                summary=summary_val,
+                tags=tags_val,
+                body=final_body,
+                why_care=why_val
+            )
+
+            # Track position updates inside LanceDB index
+            embedding = embed_model.encode(body_val).tolist()
+            table.add([{"vector": embedding, "id": z_id, "text": f"{title_val}: {summary_val}"}])
+            print(f"      + Successfully Ingested OKF Zettel: {z_id} ({title_val[:40]}...)")
 
 def process_ingestion_pipeline():
     """Builds atomic OKF nodes using plain text structural tagging rather than fragile JSON schemas."""
@@ -153,97 +396,20 @@ def process_ingestion_pipeline():
         if f_hash in manifest: continue
 
         print(f"\n>>> Processing Source File: {filename}")
-        raw_text = extract_text(path)
-        if not raw_text or len(raw_text) < 100: continue
 
-        # Keep chunk size tight for local model context safety
-        chunk_size, overlap = 3000, 400
-        chunks = [raw_text[i:i + chunk_size] for i in range(0, len(raw_text), chunk_size - overlap)]
-        print(f"    > Shredding into {len(chunks)} chunks...")
-
-        for idx, chunk in enumerate(chunks):
-            print(f"      Processing chunk {idx + 1}/{len(chunks)}...")
-
-            shred_sys = (
-                "You are an Advanced Knowledge Architect. Deconstruct the incoming text into atomic, self-contained zettel concepts.\n"
-                "For each distinct concept identified, output it using exactly the following plain-text structural layout:\n\n"
-                "<<<START_ZETTEL>>>\n"
-                "TITLE: Title of the concept\n"
-                "TYPE: concept\n"
-                "TAGS: tag1, tag2\n"
-                "SUMMARY: Short structural overview under 50 words.\n"
-                "RELATED: Key Topic A, Key Topic B\n"
-                "BODY:\n"
-                "Deep-dive analytical description, minimum 200 words. Explain Mechanics and Implications.\n"
-                "<<<END_ZETTEL>>>"
-            )
-
-            raw_output = call_llm(f"TARGET CONTENT TO TRANSLATE:\n{chunk}", shred_sys)
-            if not raw_output:
-                print(f"      ! Chunk {idx + 1} failed: The local model returned a blank string. Check your LM Studio Context Slider!")
-                continue
-
-            # Parse out zettel text blocks cleanly using text tokens
-            zettel_blocks = re.findall(r'<<<START_ZETTEL>>>(.*?)<<<END_ZETTEL>>>', raw_output, re.DOTALL)
-
-            if not zettel_blocks:
-                print(f"      ! Chunk {idx + 1} skipped: Could not locate text bounds (<<<START_ZETTEL>>>).")
-                continue
-
-            for block in zettel_blocks:
-                # Direct line-by-line field scrapers
-                def get_field(field_name: str) -> str:
-                    m = re.search(rf'^\s*{field_name}\s*:\s*(.*)$', block, re.MULTILINE | re.IGNORECASE)
-                    return m.group(1).strip() if m else ""
-
-                title_val = get_field("TITLE")
-                type_val = get_field("TYPE") or "concept"
-                summary_val = get_field("SUMMARY")
-                related_raw = get_field("RELATED")
-
-                tags_raw = get_field("TAGS")
-                tags_val = [t.strip() for t in tags_raw.split(',') if t.strip()]
-
-                body_match = re.search(r'BODY:\s*(.*)', block, re.DOTALL | re.IGNORECASE)
-                body_val = body_match.group(1).strip() if body_match else ""
-
-                if not title_val or not body_val: continue
-
-                z_id = f"z_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
-
-                # Deterministic Vector Link Resolution using LanceDB
-                discovered_links = []
-                related_topics = [r.strip() for r in related_raw.split(',') if r.strip()]
-                for topic in related_topics:
-                    topic_vector = embed_model.encode(topic).tolist()
-                    neighbors = table.search(topic_vector).limit(1).to_list()
-                    if neighbors and neighbors[0]['id'] != 'init':
-                        target_id = neighbors[0]['id']
-                        rel_type = re.sub(r'[^a-zA-Z0-9_]', '_', topic.lower().strip())
-                        discovered_links.append(f"[[related_to_{rel_type}::{target_id}]]")
-
-                # Combine body with discovered relational links
-                if discovered_links:
-                    link_section = "\n".join([f"- {link}" for link in discovered_links])
-                    final_body = f"{body_val}\n\n## Graph Connections\n{link_section}"
-                else:
-                    final_body = body_val
-
-                # Write out pure Markdown files to disk
-                OKFZettel.write_to_disk(
-                    directory=Path(ZETTEL_DIR),
-                    z_id=z_id,
-                    title=title_val,
-                    z_type=type_val,
-                    summary=summary_val,
-                    tags=tags_val,
-                    body=final_body
-                )
-
-                # Track position updates inside LanceDB index
-                embedding = embed_model.encode(body_val).tolist()
-                table.add([{"vector": embedding, "id": z_id, "text": f"{title_val}: {summary_val}"}])
-                print(f"      + Successfully Ingested OKF Zettel: {z_id} ({title_val[:40]}...)")
+        if filename.lower().endswith('.web'):
+            urls = extract_urls_from_web_file(path)
+            for url in urls:
+                print(f"    > Fetching URL: {url}")
+                md_text = convert_url_to_markdown(url)
+                if not md_text or len(md_text) < 100:
+                    print(f"      ! Skipped: Retrieved content too short or empty.")
+                    continue
+                _shred_text_to_zettels(md_text, url, table, embed_model)
+        else:
+            raw_text = extract_text(path)
+            if not raw_text or len(raw_text) < 100: continue
+            _shred_text_to_zettels(raw_text, filename, table, embed_model)
 
         manifest[f_hash] = {"name": filename, "processed": datetime.now(timezone.utc).isoformat()}
         os.rename(path, os.path.join(RAW_ARCHIVE, filename))
@@ -380,11 +546,12 @@ class LocalGraphRAGRouter:
 
         full_context = "\n".join(context_parts)
 
-        # 4. Generate the query synthesis via the local LLM
+        # 4. Generate the query synthesis via the configured LLM provider
         sys_prompt = (
-            "You are a Thinking Partner. Synthesize a comprehensive answer using the provided GraphRAG structural context.\n"
-            "Map hidden connections across cross-functional ideas by utilizing the structural relation links.\n"
-            "Always cite relevant insights by using the explicit node ID format: [[z_id]]."
+            "You are a Thinking Partner.\n"
+            "Synthesize answers using the GraphRAG structural context below.\n"
+            "Map hidden connections across cross-functional ideas.\n"
+            "Cite insights using the node ID format: [[z_id]]."
         )
 
         usr_prompt = f"Question: {question}\n\nRELEVANT GRAPH CONTEXT VAULT:\n{full_context}"
