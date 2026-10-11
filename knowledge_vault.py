@@ -196,7 +196,16 @@ def _request(url: str, headers: Dict, payload: Dict, extract_fn) -> Optional[str
         raw_output = extract_fn(res_obj)
 
         if not raw_output or not raw_output.strip():
-            print(f"\n[DEBUG] Empty response generated. Raw Server JSON Payload:\n{res_obj}\n")
+            # Detect truncated generations (hit the token ceiling) to give an actionable message
+            finish_reason = None
+            try:
+                finish_reason = res_obj['choices'][0].get('finish_reason') or res_obj['choices'][0].get('native_finish_reason')
+            except Exception:
+                pass
+            if finish_reason in ('length', 'max_tokens'):
+                print(f"      ! LLM response truncated: hit max_tokens ({MAX_TOKENS}) before producing content.")
+            else:
+                print(f"\n[DEBUG] Empty response generated. Raw Server JSON Payload:\n{res_obj}\n")
             return None
 
         return raw_output
@@ -301,83 +310,101 @@ def _shred_text_to_zettels(raw_text: str, source_label: str, table, embed_model)
 
         raw_output = call_llm(f"TARGET CONTENT TO TRANSLATE:\n{chunk}", shred_sys)
         if not raw_output:
-            print(f"      ! Chunk {idx + 1} failed: The LLM returned a blank string. Check your provider config and context limits.")
+            print(f"      ! Chunk {idx + 1} failed: The LLM returned a blank string. Retrying with smaller sub-chunks.")
+            # A blank response usually means the provider hit its token ceiling on a large chunk.
+            # Retry the same content as smaller sub-chunks so it actually gets processed.
+            sub_chunk_size = chunk_size // 2
+            sub_chunks = [chunk[i:i + sub_chunk_size] for i in range(0, len(chunk), sub_chunk_size - overlap)]
+            for sub_idx, sub_chunk in enumerate(sub_chunks):
+                print(f"        Processing sub-chunk {sub_idx + 1}/{len(sub_chunks)}...")
+                sub_output = call_llm(f"TARGET CONTENT TO TRANSLATE:\n{sub_chunk}", shred_sys)
+                if not sub_output:
+                    print(f"        ! Sub-chunk {sub_idx + 1} failed: The LLM returned a blank string.")
+                    continue
+                _process_llm_output(sub_output, idx, sub_chunk, table, embed_model, source_label)
             continue
 
         # Parse out zettel text blocks cleanly using text tokens
-        zettel_blocks = re.findall(r'<<<START_ZETTEL>>>(.*?)<<<END_ZETTEL>>>', raw_output, re.DOTALL)
+        _process_llm_output(raw_output, idx, chunk, table, embed_model, source_label)
 
-        if not zettel_blocks:
-            print(f"      ! Chunk {idx + 1} skipped: Could not locate text bounds (<<<START_ZETTEL>>>).")
-            continue
+def _process_llm_output(raw_output: str, chunk_idx: int, chunk_text: str, table, embed_model, source_label: str) -> None:
+    """Parses a raw LLM response into zettel blocks and persists each one."""
+    zettel_blocks = re.findall(r'<<<START_ZETTEL>>>(.*?)<<<END_ZETTEL>>>', raw_output, re.DOTALL)
 
-        for block in zettel_blocks:
-            # Direct line-by-line field scrapers
-            def get_field(field_name: str) -> str:
-                m = re.search(rf'^\s*{field_name}\s*:\s*(.*)$', block, re.MULTILINE | re.IGNORECASE)
-                return m.group(1).strip() if m else ""
+    if not zettel_blocks:
+        print(f"      ! Chunk {chunk_idx + 1} skipped: Could not locate text bounds (<<<START_ZETTEL>>>).")
+        return
 
-            title_val = get_field("TITLE")
-            type_val = get_field("TYPE") or "concept"
-            summary_val = get_field("SUMMARY")
-            why_val = get_field("WHY")
-            related_raw = get_field("RELATED")
+    for block in zettel_blocks:
+        # Direct line-by-line field scrapers
+        def get_field(field_name: str) -> str:
+            m = re.search(rf'^\s*{field_name}\s*:\s*(.*)$', block, re.MULTILINE | re.IGNORECASE)
+            return m.group(1).strip() if m else ""
 
-            tags_raw = get_field("TAGS")
-            tags_val = [t.strip() for t in tags_raw.split(',') if t.strip()]
+        title_val = get_field("TITLE")
+        type_val = get_field("TYPE") or "concept"
+        summary_val = get_field("SUMMARY")
+        why_val = get_field("WHY")
+        related_raw = get_field("RELATED")
 
-            body_match = re.search(r'BODY:\s*(.*)', block, re.DOTALL | re.IGNORECASE)
-            body_val = body_match.group(1).strip() if body_match else ""
+        tags_raw = get_field("TAGS")
+        tags_val = [t.strip() for t in tags_raw.split(',') if t.strip()]
 
-            if not title_val or not body_val: continue
+        body_match = re.search(r'BODY:\s*(.*)', block, re.DOTALL | re.IGNORECASE)
+        body_val = body_match.group(1).strip() if body_match else ""
 
-            z_id = f"z_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+        if not title_val or not body_val: continue
 
-            # Deterministic Vector Link Resolution using LanceDB
-            discovered_links = []
-            related_topics = [r.strip() for r in related_raw.split(',') if r.strip()]
-            for topic in related_topics:
-                topic_vector = embed_model.encode(topic).tolist()
-                neighbors = table.search(topic_vector).limit(1).to_list()
-                if neighbors and neighbors[0]['id'] != 'init':
-                    target_id = neighbors[0]['id']
-                    rel_type = re.sub(r'[^a-zA-Z0-9_]', '_', topic.lower().strip())
-                    discovered_links.append(f"[[related_to_{rel_type}::{target_id}]]")
+        z_id = f"z_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
 
-            # Combine body with discovered relational links
-            if discovered_links:
-                link_section = "\n".join([f"- {link}" for link in discovered_links])
-                final_body = f"{body_val}\n\n## Graph Connections\n{link_section}"
-            else:
-                final_body = body_val
+        # Deterministic Vector Link Resolution using LanceDB
+        discovered_links = []
+        related_topics = [r.strip() for r in related_raw.split(',') if r.strip()]
+        for topic in related_topics:
+            topic_vector = embed_model.encode(topic).tolist()
+            neighbors = table.search(topic_vector).limit(1).to_list()
+            if neighbors and neighbors[0]['id'] != 'init':
+                target_id = neighbors[0]['id']
+                rel_type = re.sub(r'[^a-zA-Z0-9_]', '_', topic.lower().strip())
+                discovered_links.append(f"[[related_to_{rel_type}::{target_id}]]")
 
-            # Write out pure Markdown files to disk
-            OKFZettel.write_to_disk(
-                directory=Path(ZETTEL_DIR),
-                z_id=z_id,
-                title=title_val,
-                z_type=type_val,
-                summary=summary_val,
-                tags=tags_val,
-                body=final_body,
-                why_care=why_val
-            )
+        # Combine body with discovered relational links
+        if discovered_links:
+            link_section = "\n".join([f"- {link}" for link in discovered_links])
+            final_body = f"{body_val}\n\n## Graph Connections\n{link_section}"
+        else:
+            final_body = body_val
 
-            # Track position updates inside LanceDB index
-            embedding = embed_model.encode(body_val).tolist()
-            table.add([{"vector": embedding, "id": z_id, "text": f"{title_val}: {summary_val}"}])
-            print(f"      + Successfully Ingested OKF Zettel: {z_id} ({title_val[:40]}...)")
+        # Write out pure Markdown files to disk
+        OKFZettel.write_to_disk(
+            directory=Path(ZETTEL_DIR),
+            z_id=z_id,
+            title=title_val,
+            z_type=type_val,
+            summary=summary_val,
+            tags=tags_val,
+            body=final_body,
+            why_care=why_val
+        )
+
+        # Track position updates inside LanceDB index
+        embedding = embed_model.encode(body_val).tolist()
+        table.add([{"vector": embedding, "id": z_id, "text": f"{title_val}: {summary_val}"}])
+        print(f"      + Successfully Ingested OKF Zettel: {z_id} ({title_val[:40]}...)")
+
 
 def process_ingestion_pipeline():
     """Builds atomic OKF nodes using plain text structural tagging rather than fragile JSON schemas."""
+    print("Initializing Embedding Model...")
+    embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+    embed_dim = embed_model.get_sentence_embedding_dimension()
+
     print("Initializing Database Connections...")
     db = lancedb.connect(DB_URI)
     try:
         table = db.open_table("notes")
     except Exception:
-        table = db.create_table("notes", data=[{"vector": [0.0]*384, "id": "init", "text": "root"}])
-
-    embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+        table = db.create_table("notes", data=[{"vector": [0.0]*embed_dim, "id": "init", "text": "root"}])
     manifest = {}
     if os.path.exists(MANIFEST_FILE):
         with open(MANIFEST_FILE, "r") as f: manifest = json.load(f)
@@ -415,7 +442,7 @@ def process_ingestion_pipeline():
 
     with open(MANIFEST_FILE, "w") as f: json.dump(manifest, f, indent=4)
     print("Compiling global structural graph cache...")
-    router = LocalGraphRAGRouter(ZETTEL_DIR, DB_URI)
+    router = LocalGraphRAGRouter(ZETTEL_DIR, DB_URI, embed_model=embed_model)
 
     # Clear the old cache to ensure newly ingested zettels are included in the cold-start build
     cache_file = Path(ZETTEL_DIR) / ".graph_cache.json"
@@ -428,10 +455,10 @@ def process_ingestion_pipeline():
 class LocalGraphRAGRouter:
     """Compiles local flat text files into an active, searchable network topology graph."""
 
-    def __init__(self, zettel_dir: str, db_uri: str):
+    def __init__(self, zettel_dir: str, db_uri: str, embed_model=None):
         self.zettel_dir = Path(zettel_dir)
         self.db = lancedb.connect(db_uri)
-        self.embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.embed_model = embed_model or SentenceTransformer('all-MiniLM-L6-v2')
         self.graph = nx.DiGraph()
         self.vault: Dict[str, OKFZettel] = {}
 
