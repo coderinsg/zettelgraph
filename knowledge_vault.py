@@ -34,6 +34,29 @@ PROVIDER = _CONFIG.get("active_provider", "LMSTUDIO").upper()
 MAX_TOKENS = int(_CONFIG.get("max_tokens", 4096))
 TEMPERATURE = float(_CONFIG.get("temperature", 0.2))
 
+# Context/output budgeting — keep the generated answer well-fed by reserving a
+# share of the model's window for output and capping how much graphite context
+# is allowed to consume. Both are externalized so they can be tuned per model.
+MODEL_CONTEXT_WINDOW = int(_CONFIG.get("model_context_window", 16384))
+OUTPUT_RESERVE_RATIO = float(_CONFIG.get("output_reserve_ratio", 0.30))
+
+# Reserve at least RESERVED_OUTPUT_TOKENS for generation, even if max_tokens is
+# configured lower; effectives cap is the larger of the two. Everything left
+# over is the hard token budget the GraphRAG context must fit within.
+RESERVED_OUTPUT_TOKENS = int(MODEL_CONTEXT_WINDOW * OUTPUT_RESERVE_RATIO)
+EFFECTIVE_MAX_TOKENS = max(MAX_TOKENS, RESERVED_OUTPUT_TOKENS)
+CONTEXT_TOKEN_BUDGET = max(1, MODEL_CONTEXT_WINDOW - EFFECTIVE_MAX_TOKENS)
+
+# Rough chars-per-token heuristic used to estimate context size without running a
+# tokenizer every query — close enough to keep the window under control.
+# The client-side tokenizer can be consulted for higher precision if ever needed.
+_CHARS_PER_TOKEN = 4
+
+
+def _approx_tokens(text: str) -> int:
+    """Approximates token count from character length (~4 chars/token)."""
+    return max(1, len(text) // _CHARS_PER_TOKEN)
+
 _P = _CONFIG.get("providers", {})
 
 # Per-provider connection parameters — each resolves from provider.yaml with inline fallbacks
@@ -139,7 +162,7 @@ def _call_lmstudio(prompt: str, system_prompt: str) -> Optional[str]:
         "model": LMSTUDIO_MODEL,
         "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
         "temperature": TEMPERATURE,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": EFFECTIVE_MAX_TOKENS,
     }
     return _request(LMSTUDIO_URL, {"Content-Type": "application/json"}, payload, _extract_openai_response)
 
@@ -156,7 +179,7 @@ def _call_openai(prompt: str, system_prompt: str) -> Optional[str]:
         "model": OPENAI_MODEL,
         "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
         "temperature": TEMPERATURE,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": EFFECTIVE_MAX_TOKENS,
     }
     return _request(f"{OPENAI_BASE_URL}/chat/completions", headers, payload, _extract_openai_response)
 
@@ -172,7 +195,7 @@ def _call_anthropic(prompt: str, system_prompt: str) -> Optional[str]:
     }
     payload = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": EFFECTIVE_MAX_TOKENS,
         "messages": [{"role": "user", "content": prompt}],
     }
     if system_prompt:
@@ -203,7 +226,7 @@ def _request(url: str, headers: Dict, payload: Dict, extract_fn) -> Optional[str
             except Exception:
                 pass
             if finish_reason in ('length', 'max_tokens'):
-                print(f"      ! LLM response truncated: hit max_tokens ({MAX_TOKENS}) before producing content.")
+                print(f"      ! LLM response truncated: hit max_tokens ({EFFECTIVE_MAX_TOKENS}) before producing content.")
             else:
                 print(f"\n[DEBUG] Empty response generated. Raw Server JSON Payload:\n{res_obj}\n")
             return None
@@ -549,26 +572,53 @@ class LocalGraphRAGRouter:
             ego = nx.ego_graph(self.graph, seed, radius=max_hops)
             combined_subgraph = nx.compose(combined_subgraph, ego)
 
-        # 3. Apply the Metadata-First Protocol to optimize context packaging
+        # 3. Metadata-First Protocol — assemble context to fit inside the hard
+        #    token budget (CONTEXT_TOKEN_BUDGET), prioritising the vector-matched
+        #    seed nodes and truncating bodies so output never gets starved.
+        remaining_tokens = CONTEXT_TOKEN_BUDGET
         context_parts = []
-        context_parts.append("=== EXTRACTED GRAPH RELATIONAL PATHWAYS ===")
-        for u, v, data in combined_subgraph.edges(data=True):
-            u_title = self.graph.nodes[u].get('title', u)
-            v_title = self.graph.nodes[v].get('title', v)
-            context_parts.append(f"- Pathway: {u_title} -> [{data.get('relation', 'references')}] -> {v_title}")
 
-        context_parts.append("\n=== CORE DATA PAYLOADS ===")
-        for node in combined_subgraph.nodes():
+        def add_part(text: str) -> bool:
+            nonlocal remaining_tokens
+            cost = _approx_tokens(text)
+            if cost > remaining_tokens:
+                return False
+            context_parts.append(text)
+            remaining_tokens -= cost
+            return True
+
+        if add_part("=== EXTRACTED GRAPH RELATIONAL PATHWAYS ==="):
+            for u, v, data in combined_subgraph.edges(data=True):
+                u_title = self.graph.nodes[u].get('title', u)
+                v_title = self.graph.nodes[v].get('title', v)
+                if not add_part(f"- Pathway: {u_title} -> [{data.get('relation', 'references')}] -> {v_title}"):
+                    break
+
+        add_part("\n=== CORE DATA PAYLOADS ===")
+
+        # Seed nodes (direct vector hits) first, then the rest of the ego mesh
+        ordered_nodes = seed_nodes + [n for n in combined_subgraph.nodes() if n not in seed_nodes]
+        for node in ordered_nodes:
             # Dynamically read the file body from disk for the isolated subgraph nodes
             md_file = self.zettel_dir / f"{node}.md"
-            if md_file.exists():
-                zettel = OKFZettel(md_file)
-                context_parts.append(
-                    f"--- NOTE MATCH [[{node}]] ---\n"
-                    f"Title: {zettel.metadata.get('title')}\n"
-                    f"Summary: {zettel.metadata.get('summary')}\n"
-                    f"Payload Body:\n{zettel.content_body}\n"
-                )
+            if not md_file.exists():
+                continue
+            zettel = OKFZettel(md_file)
+            header = (
+                f"--- NOTE MATCH [[{node}]] ---\n"
+                f"Title: {zettel.metadata.get('title')}\n"
+                f"Summary: {zettel.metadata.get('summary')}\n"
+            )
+            header_cost = _approx_tokens(header) + _approx_tokens("Payload Body:\n")
+            if header_cost > remaining_tokens:
+                break
+            # Spend whatever budget remains on the body, truncating on a word boundary
+            body_chars = (remaining_tokens - header_cost) * _CHARS_PER_TOKEN
+            body = zettel.content_body
+            if len(body) > body_chars:
+                body = body[:body_chars].rsplit(' ', 1)[0] + " ... [truncated to fit window]"
+            if not add_part(f"{header}Payload Body:\n{body}\n"):
+                break
 
         full_context = "\n".join(context_parts)
 

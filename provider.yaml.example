@@ -16,6 +16,14 @@ active_provider: OPENAI
 max_tokens: 4096
 temperature: 0.2
 
+# GraphRAG token budgeting — control how the model's context window is split
+# between fetched graph context and the synthesized answer.
+#   model_context_window : total window the model accepts, in tokens
+#   output_reserve_ratio : minimum share of that window RESERVED for the answer.
+#                          Context is capped at window * (1 - ratio).
+model_context_window: 32768
+output_reserve_ratio: 0.30
+
 providers:
   LMSTUDIO:
     url: http://localhost:1234/v1/chat/completions

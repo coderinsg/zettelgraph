@@ -74,6 +74,13 @@ active_provider: OPENAI    # LMSTUDIO | OLLAMA | OPENAI | ANTHROPIC
 max_tokens: 4096
 temperature: 0.2
 
+# GraphRAG token budgeting: split the model's window between retrieved
+# context and the synthesized answer. Output is always reserved a minimum
+# share of the window (window * output_reserve_ratio); retrieved context
+# is capped at window * (1 - output_reserve_ratio).
+model_context_window: 32768
+output_reserve_ratio: 0.30
+
 providers:
   LMSTUDIO:
     url: "http://localhost:1234/v1/chat/completions"
