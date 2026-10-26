@@ -551,8 +551,25 @@ class LocalGraphRAGRouter:
         with open(cache_path, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, indent=4)
 
-    def query(self, question: str, max_hops: int = 2) -> str:
-        """Executes a hybrid vector and topological multi-hop graph search query."""
+    def query(self, question: str, max_hops: int = 2, context: Optional[str] = None) -> str:
+        """Executes a hybrid vector and topological multi-hop graph search query.
+
+        If ``context`` is provided, it is used verbatim as the retrieved context
+        (useful for external/long-context sources that cannot be typed inline);
+        otherwise the context is assembled from the graph's vector + topology search.
+        """
+        # If external context was supplied, skip graph retrieval entirely and
+        # synthesize directly over the caller-provided context.
+        if context:
+            sys_prompt = (
+                "You are a Thinking Partner.\n"
+                "Synthesize answers using the context below.\n"
+                "Map hidden connections across cross-functional ideas.\n"
+                "Cite insights using the node ID format: [[z_id]]."
+            )
+            usr_prompt = f"Question: {question}\n\nRELEVANT CONTEXT:\n{context}"
+            return call_llm(usr_prompt, sys_prompt)
+
         # Instantly populates the graph topology via the cache map
         self.rebuild_graph_from_vault()
         table = self.db.open_table("notes")
@@ -637,6 +654,36 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--ingest":
         process_ingestion_pipeline()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--file":
+        # --file <context.txt> [--question "question"]
+        # Synthesize directly over an external context file instead of typing it inline.
+        args = sys.argv[2:]
+        if not args:
+            print("Usage: python3 knowledge_vault.py --file <context.txt> [--question \"...\"]")
+            sys.exit(1)
+
+        file_path = Path(args[0]).resolve()
+        if not file_path.exists():
+            print(f"\n      ! Context file not found: {file_path}")
+            sys.exit(1)
+
+        question = "Synthesize the key insights from the provided context and surface the most important cross-connections."
+        if "--question" in args:
+            idx = args.index("--question")
+            if idx + 1 < len(args):
+                question = args[idx + 1]
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            context = f.read()
+        if not context.strip():
+            print(f"\n      ! Context file is empty: {file_path}")
+            sys.exit(1)
+
+        print(f"\n--- GraphRAG External-Context Synthesis ---")
+        print(f"Reading context from: {file_path}")
+        router = LocalGraphRAGRouter(ZETTEL_DIR, DB_URI)
+        answer = router.query(question, context=context)
+        print(f"\n--- Synthesized Answer ---\n{answer}")
     else:
         print("\n--- Upgraded GraphRAG LLM-Wiki Query Loop ---")
         router = LocalGraphRAGRouter(ZETTEL_DIR, DB_URI)

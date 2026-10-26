@@ -49,6 +49,15 @@ AI has evolved from a specialized tool to a foundational utility, comparable to 
 
 Type `exit` or `quit` to leave.
 
+### Query using an external context file
+
+For long context that can't be typed into the prompt, pass a file containing the context. The program synthesizes an answer directly over that file's contents instead of doing vector/graph retrieval:
+
+```bash
+python3 knowledge_vault.py --file context.txt
+python3 knowledge_vault.py --file context.txt --question "Summarize the key security risks"
+```
+
 ## Source File Types
 
 | Extension | Description |
